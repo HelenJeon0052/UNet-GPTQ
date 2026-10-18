@@ -6,11 +6,7 @@ Paired FP / GPTQ-w4 reconstruction runner. See README.md for checking contracts.
 from __future__ import annotations
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-os.environ["TORCH_USE_CUDA_DSA"] = "1"
-
-print("CUDA_VISIBLE_DEVICES:", os.environ["CUDA_VISIBLE_DEVICES"], flush=True)
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import argparse
 import copy
@@ -37,13 +33,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from improved_diffusion import dist_util, logger
-from improved_diffusion.script_util_duo import (
-    add_dict_to_argparser, args_to_dict, create_model_and_two_diffusion, model_and_diffusion_defaults,
-)
+from unet_gptq.domain.data_consistency import validate_dc_weight
+from unet_gptq.diffusion.diagnostics import SamplingDiagnostics
 
 from unet_gptq.domain.forward_operator import channels_to_img, img_to_channels
-from unet_gptq.diffusion.sampler import reconstruct_pair
+from unet_gptq.diffusion.samplers import reconstruct_pair
 
 STAGES = ("coarse", "refined")
 QUALITY_KEYS = ("magnitude_nmse", "magnitude_rmse", "psnr_db", "dc_relative_l2")
@@ -105,7 +99,7 @@ def validate_mask(mask: Any, shape: tuple[int, int], layout: str) -> np.ndarray:
     if value.shape != shape:
         raise ValueError(f"Mask must have shape {shape} or {(1, 1, *shape)}, got {value.shape}")
     if np.iscomplexobj(value) or not np.isfinite(value).all():
-        raise ValueError(f"Mask must be finite and real, got {mask.dtype}")
+        raise ValueError(f"Mask must be finite and real, got {value.dtype}")
     if not np.isin(value, [0, 1]).all() or not value.any():
         raise ValueError(f"A sampling mask contract requires binary {0, 1}")
     if layout == "centered":
@@ -220,7 +214,7 @@ def quality_rows(outputs: dict, case: Case, seed: int, condition: str) -> list[d
                     "seed": seed, "condition": condition, "stage": stage, 
                     "sample_index": sample_id, "pair_index": pair_index,
                     "magnitude_nmse": float(np.sum(difference**2)) / np.sum(magnitude**2),
-                    "magnitude_rsme": math.sqrt(mse), "psnr_db": psnr, "psnr_is_posinf": mse == 0, "data_range": peak, "dc_relative_l2": relative_l2(residual, measured)
+                    "magnitude_rmse": math.sqrt(mse), "psnr_db": psnr, "psnr_is_posinf": mse == 0, "data_range": peak, "dc_relative_l2": relative_l2(residual, measured)
                 })
     
     return rows
@@ -314,6 +308,10 @@ def run_experiment(case: Case, backend: Callable, args: argparse.Namespace, out:
                 validate_outputs(outputs, case)
                 np.savez_compressed(run_dir / "outputs.npz", **{stage: outputs[stage] for stage in STAGES})
                 info = dict(info, seed=seed, condition=condition, status="ok")
+                diagnostic_rows = info.pop("_diagnostic_rows", None)
+                if diagnostic_rows is not None:
+                    for filename, rows in diagnostic_rows.items():
+                        write_csv(run_dir / filename, [dict(row, seed=seed, condition=condition) for row in rows])
                 write_json(run_dir / "run.json", info)
                 runs.append(info)
                 available[condition], metadata[condition] = outputs, info
@@ -333,7 +331,7 @@ def run_experiment(case: Case, backend: Callable, args: argparse.Namespace, out:
                 hashes = [metadata[name].get("rng_end_sha256") for name in ("fp", "fp_repeat")]
                 starts = [metadata[name].get("rng_start_sha256") for name in ("fp", "fp_repeat")]
                 audit["fp_repeat"] = comparison
-                audit["fp_repeat_passed"] = (all(items["allclose"] for item in comparison.values())
+                audit["fp_repeat_passed"] = (all(item["allclose"] for item in comparison.values())
                                                 and bool(hashes[0]) and hashes[0] == hashes[1]
                                                 and bool(starts[0]) and starts[0] == starts[1]
                 )
@@ -359,7 +357,7 @@ def run_experiment(case: Case, backend: Callable, args: argparse.Namespace, out:
 
                 pairs.extend(paired_rows(rows_by_condition["fp"], rows_by_condition["w4"], audit["eligible"]))
             except ValueError as e:
-                failures.append("seed": seed, "condition": "pairing", "error": str(e))
+                failures.append({"seed": seed, "condition": "pairing", "error": str(e)})
 
 
         audits.append(audit)
@@ -370,7 +368,7 @@ def run_experiment(case: Case, backend: Callable, args: argparse.Namespace, out:
         write_json(out / "progress.json", {"completed_seeds": len(audits), "audits": audits, "failures": failures})
 
     comparison_req = "w4" in args.conditions
-    gates_failed = (comparison_req and any(not a["eligible"] for a in audits)) or (args.check_fp_repeat and any(a["fp_repeat"] is not True for a in audits))
+    gates_failed = (comparison_req and any(not a["eligible"] for a in audits)) or (args.check_fp_repeat and any(a["fp_repeat_passed"] is not True for a in audits))
 
     summary = summarize_pairs(pairs)
     summary.update(status="failed" if failures or gates_failed else "completed", failures = failures, audits = audits, runs = runs,
@@ -438,8 +436,7 @@ class TorchBackend:
                 raise ValueError(f"Set {reserved} via the runner; do not duplicate it in --model_options.")
         self.config.update(options)
         self.config["image_size"] = args.image_size
-        if "timestep_respacing" in self.config:
-            self.config["timestep_respacing"] = ""
+        self.config["timestep_respacing"] = args.timestep_respacing
         if "use_fp16" in self.config:
             self.config["use_fp16"] = args.use_fp16
         if manifest and manifest["format"] == "custom" and self.loader is None:
@@ -526,73 +523,85 @@ class TorchBackend:
             return (array[:, 0::2] + 1j * array[:, 1::2]).astype(np.complex64)
         raise ValueError(f"Unsupported sampler output dtype/shape: {value.dtype}, {value.shape}.")
 
-    def __call__(self, condition: str, seed: int) -> tuple[dict, dict]:
+    def _build_model(self, condition: str):
+        """Load a fresh condition; never quantize or reuse the FP reference in place."""
         torch, args = self.torch, self.args
         self.seed(args.model_init_seed)
-        model = diffusion = diffusion2 = obs = mask = fp = result = loaded = parameter = None
+        model, diffusion, diffusion2 = self.factory(**copy.deepcopy(self.config))
+        fp = self.load_state(args.model_path)
+        model.load_state_dict(fp, strict=True)
+        quant_info = {"format": "original_fp", "packed_int4_execution": False}
+        if condition == "w4" and self.manifest["format"] == "dequantized_state_dict":
+            quant_info = self.load_dequantized(model, fp)
+        if args.use_fp16:
+            if not hasattr(model, "convert_to_fp16"):
+                raise TypeError("Model does not include convert_to_fp16()")
+            model.convert_to_fp16()
+        model.to(self.device)
+        if condition == "w4" and self.manifest["format"] == "custom":
+            loaded = self.loader(
+                model=model, checkpoint_path=Path(args.w4_model_path),
+                manifest=copy.deepcopy(self.manifest), device=self.device,
+            )
+            if not isinstance(loaded, tuple) or len(loaded) != 2:
+                raise TypeError("Custom loader must return (nn.Module, JSON-serializable metadata)")
+            model, quant_info = loaded
+            if not isinstance(model, torch.nn.Module) or not isinstance(quant_info, dict):
+                raise TypeError("Invalid custom W4 loader result")
+        model.eval()
+        model.requires_grad_(False)
+        return model, diffusion, diffusion2, quant_info
 
+    def reconstruction_policy(self) -> dict:
+        return {"fft_layout": "unshifted", "fft_norm": "backward",
+                "mri_dtype": "complex64", "dc_weight": self.args.dc_weight,
+                "dc_method": ("hard" if self.args.dc_weight == 1 else
+                              "disabled" if self.args.dc_weight == 0 else "soft"),
+                "mask": "binary; separate from dc_weight"}
+    
+    def __call__(self, condition: str, seed: int) -> tuple[dict, dict]:
+        torch, args = self.torch, self.args
+        model = diffusion = diffusion2 = reference_model = obs = mask = result = None
+        diagnostic = replay = None
         
         try:
             load_start = time.perf_counter()
-            model, diffusion, diffusion2 = self.factory(**copy.deepcopy(self.config))
-            fp = self.load_state(args.model_path)
-            model.load_state_dict(fp, strict=True)
-            quant_info = {"format": "original_fp", "packed_int4_execution": False}
-            if condition == "w4" and self.manifest["format"] == "dequantized_state_dict":
-                quant_info = self.load_dequantized(model, fp)
-            fp = None
-
-            if args.use_fp16:
-                if not hasattr(model, "convert_to_fp16"):
-                    raise TypeError("Model does not include convert_to_fp16()")
-                model.convert_to_fp16()
-        
-            model.to(self.device)
-
-            if condition == "w4" and self.manifest["format"] == "custom":
-                loaded = self.loader(
-                    model = model, checkpoint_path = Path(args.w4_model_path), manifest = copy.deepcopy(self.manifest), device = self.device
-                )
-
-                if not isinstance(loaded, tuple) or len(loaded) != 2:
-                    raise TypeError("Custom loader must return (nn.Module, JSON-serialized metadata)")
-                
-                model, quant_info = loaded
-
-                if not isinstance(model, torch.nn.Module) or not isinstance(quant_info, dict):
-                    raise TypeError("not valid custom w4 loader result")
-                
-            model.eval()
-            model.requires_grad_(False)
-            obs = torch.from_numpy(self.case.observed.copy()).to(self.device)
+            model, diffusion, diffusion2, quant_info = self._build_model(condition)
+            
+            obs = torch.from_numpy(self.case.observed.copy()).to(self.device, dtype=torch.complex64)
             mask = torch.from_numpy(self.case.mask.copy()).to(self.device)
             dtypes: dict[str, int] = {}
 
             for parameter in model.parameters():
                 dtypes[str(parameter.dtype)] = dtypes.get(str(parameter.dtype), 0) + parameter.numel()
+            
+            parameter = None
+
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
             
             load_seconds = time.perf_counter() - load_start
 
+            sampler_options = dict(num_samples=args.num_samples, refine_steps=args.refine_steps,
+                                   clip_denoised=args.clip_denoised, dc_weight=args.dc_weight)
             self.seed(seed)
             sampling_state = self.rng_state()
-            self.restore_rng(sampling_state)
+            
             rng_start = self.rng_hash()
             memory = {"baseline_allocated_bytes": None, "peak_allocated_bytes": None, "peak_reserved_bytes": None}
             if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
                 torch.cuda.reset_peak_memory_stats(self.device)
                 memory["baseline_allocated_bytes"] = torch.cuda.memory_allocated(self.device)
             start = time.perf_counter()
-            # Keep input gradients available for samplers with gradient-based DC.
-            # Parameter gradients remain disabled. No inference_mode is forced.
+            
             with torch.enable_grad():
-                result = self.sampler(model, diffusion, diffusion2, obs, mask,
-                                      args.num_samples, args.refine_steps, args.clip_denoised)
+                result = self.sampler(model, diffusion, diffusion2, obs, mask, **sampler_options)
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
             seconds = time.perf_counter() - start
             rng_end = self.rng_hash()
+            sampling_end_state = self.rng_state()
             if self.device.type == "cuda":
                 memory["peak_allocated_bytes"] = torch.cuda.max_memory_allocated(self.device)
                 memory["peak_reserved_bytes"] = torch.cuda.max_memory_reserved(self.device)
@@ -604,12 +613,53 @@ class TorchBackend:
                     "rng_start_sha256": rng_start, "rng_end_sha256": rng_end,
                     "parameter_numel_by_dtype": dtypes, "use_fp16": args.use_fp16,
                     "activation_quantization": False, "quantization": quant_info,
-                    "memory": memory, "per_step_noise_verified": False}
+                    "reconstruction_policy": self.reconstruction_policy(),
+                    "memory": memory, "per_step_noise_verified": False,
+                    "diagnostics": {"status": "disabled"}}
             # Validate metadata before considering a custom run successful.
+            if args.diagnostics:
+                # Reload to reset model/sampler state. Keep the reference model and
+                # all hook/CPU logging costs outside the measured run and its peak memory.
+                model = diffusion = diffusion2 = result = None
+                gc.collect()
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                try:
+                    model, diffusion, diffusion2, _ = self._build_model(condition)
+                    if condition == "w4":
+                        reference_model, _, _, _ = self._build_model("fp")
+                    diagnostic = SamplingDiagnostics(reference_model=reference_model, trajectory=condition)
+                    self.restore_rng(sampling_state)
+                    with torch.enable_grad():
+                        replay = self.sampler(model, diffusion, diffusion2, obs, mask,
+                                              diagnostics=diagnostic, **sampler_options)
+                    replay_outputs = {stage: self.as_complex_numpy(value)
+                                      for stage, value in zip(STAGES, replay)}
+                    agreement = compare_outputs(outputs, replay_outputs,
+                                                atol=args.repeat_atol, rtol=args.repeat_rtol)
+                    if (not all(row["allclose"] for row in agreement.values())
+                            or self.rng_hash() != rng_end):
+                        raise ValueError("Diagnostic replay changed outputs or RNG use; results are not comparable.")
+                    if not diagnostic.nfe or not diagnostic.dc_rows:
+                        raise ValueError("Sampler did not emit denoiser/DC diagnostics.")
+                    info["diagnostics"] = {
+                        "status": "completed", "replay_matches_timed_run": True,
+                        "nfe": diagnostic.nfe, "nfe_source": "diagnostic_replay",
+                        "comparison": "common_input_on_w4_trajectory" if condition == "w4" else "not_compared",
+                        "output_scope": "raw_model_output_before_DC",
+                        "fp_reference_forwards": diagnostic.nfe if condition == "w4" else 0,
+                    }
+                    info["_diagnostic_rows"] = {
+                        "denoiser_differences.csv": diagnostic.denoiser_rows,
+                        "dc_residuals.csv": diagnostic.dc_rows,
+                    }
+                finally:
+                    self.restore_rng(sampling_end_state)
             json.dumps(info, allow_nan=False)
             return outputs, info
         finally:
-            model = diffusion = diffusion2 = obs = mask = fp = result = loaded = parameter = None
+            model = diffusion = diffusion2 = reference_model = obs = mask = result = None
+            diagnostic = replay = None
             gc.collect()
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -627,7 +677,8 @@ class TorchBackend:
                 "deterministic_algorithms": not self.args.allow_nondeterministic,
                 "CUBLAS_WORKSPACE_CONFIG": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
                 "CUDA_LAUNCH_BLOCKING": os.environ.get("CUDA_LAUNCH_BLOCKING"),
-                "factory_config": self.config, "sources": sources}
+                "factory_config": self.config, "sources": sources,
+                "reconstruction_policy": self.reconstruction_policy()}
 
 def create_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -648,6 +699,8 @@ def create_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--num_samples", type=int, default=1, help="Passed unchanged to the sampler; pilot default=1.")
     parser.add_argument("--refine_steps", type=int, default=20)
     parser.add_argument("--clip_denoised", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dc_weight", type=float, default=0.5, help="Shared soft-DC weight in [0,1]; 1 gives hard DC. Default 0.5 is a pilot value.")
+    parser.add_argument("--diagnostics", action=argparse.BooleanOptionalAction, default=True, help="Replay outside timing to log raw denoiser differences and post-DC residuals.")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument("--model_init_seed", type=int, default=0)
     parser.add_argument("--check_fp_repeat", action=argparse.BooleanOptionalAction, default=True)
@@ -657,12 +710,15 @@ def create_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--use_fp16", action="store_true", help="Use the model's convert_to_fp16 for BOTH conditions.")
     parser.add_argument("--factory_module", default="improved_diffusion.script_util_duo")
-    parser.add_argument("--sampler", default="unet_gptq.diffusion.sampler:reconstruct_pair")
+    parser.add_argument("--sampler", default="unet_gptq.diffusion.samplers:reconstruct_pair")
     parser.add_argument("--model_options", default="{}", help="JSON overrides of the pretrained model/factory defaults.")
+    parser.add_argument("--timestep_respacing", default="")
     return parser
 
 
 def validate_args(args: argparse.Namespace) -> None:
+
+    validate_dc_weight(args.dc_weight)
     if "fp" not in args.conditions or len(set(args.conditions)) != len(args.conditions):
         raise ValueError("Conditions must include fp, without duplicates.")
     if len(set(args.seeds)) != len(args.seeds) or any(not 0 <= seed < 2 ** 32 for seed in [*args.seeds, args.model_init_seed]):

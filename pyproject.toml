@@ -13,11 +13,11 @@ dependencies = [
   "numpy>=1.24",
   "torch>=2.1",
 ]
+authors = [
+    { name = 'JiinJeon', email = 'jeon.isavelle@gmail.com'},]
 
 [project.optional-dependencies]
 test = ["pytest>=7.4"]
-authors = [
-    { name = 'JiinJeon', email = 'jeon.isavelle@gmail.com'},]
 
 [tool.setuptools.packages.find]
 where = ["src"]

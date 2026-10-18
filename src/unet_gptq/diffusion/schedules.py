@@ -12,7 +12,7 @@ def make_schedules(
     try:
         from improved_diffusion.script_util_duo import create_gaussian_diffusion
     except ImportError as e:
-        raise ImportError(f"Install the official DiffuseRecon fork fist")
+        raise ImportError(f"Install the official DiffuseRecon fork first")
     
     if not (0 < coarse_steps <= train_steps and 0 < refine_schedule_steps <= train_steps):
         raise ValueError(f"Wrong re-spaced schedule length")

@@ -1,6 +1,6 @@
 """
 Explicit Normalization, mask convention and packing for DiffusionRecon duo 
-an aim: to fit raw fastMRI coil combination is a seperate preprocessing option not taking ckpt / domain compatibility
+an aim: to fit raw fastMRI coil combination is a separate preprocessing option not taking ckpt / domain compatibility
 
 """
 from __future__ import annotations
@@ -11,6 +11,8 @@ from typing import Any, Literal
 
 from unet_gptq.datas.fastmri_dataset import fft2_unshifted, image_to_4ch
 
+
+SOURCE_COMMIT = "13a9e166185a959e7196b0c9e3d170b8ec50dc0e"
 
 def prep_diffusionrecon_pair(
     image: torch.Tensor, centered_mask: torch.Tensor, *, normalization: Literal["component_max", "none"] = "component_max", eps: float = 1e-8
@@ -26,7 +28,7 @@ def prep_diffusionrecon_pair(
     centered_mask: a newly generated physical frequency mask for the
     loader's conventional image.
 
-    Not to reinterpret the upstream mask asset: seperate checks are required to
+    Not to reinterpret the upstream mask asset: separate checks are required to
     verify the preprocessed source and convention
     """
     if not torch.is_complex(image):
