@@ -33,6 +33,7 @@ class Conv2dGPTQ:
         max_hessian_bytes: int = 512 * 1024**2,
         patch_chunk_size: int = 1024,
         max_patches_per_batch: int | None = 4096,
+        source_weight: torch.Tensor | None = None,
     ) -> None:
         if not isinstance(layer, nn.Conv2d):
             raise TypeError("Conv2dGPTQ requires an nn.Conv2d layer")
@@ -53,9 +54,14 @@ class Conv2dGPTQ:
         ):
             raise ValueError("max_patches_per_batch must be a positive integer or None")
         self.layer = layer
-        # Snapshot before an activation-path conversion such as model.half().
-        # Quantization must keep using the original FP checkpoint as its basis.
-        self.source_weight = layer.weight.detach().clone()
+        # An explicit checkpoint tensor permits one-layer-at-a-time collection
+        # after convert_to_fp16(), without quantizing already rounded FP16 weights.
+        source = layer.weight if source_weight is None else source_weight
+        if not isinstance(source, torch.Tensor) or source.shape != layer.weight.shape:
+            raise ValueError("source_weight must match the convolution weight shape")
+        if not source.is_floating_point() or not torch.isfinite(source).all():
+            raise ValueError("source_weight must contain finite real floating-point values")
+        self.source_weight = source.detach().clone()
         self._structure = self._layer_structure()
         self.config = GPTQConfig() if config is None else config
         if not isinstance(self.config, GPTQConfig):
@@ -73,6 +79,7 @@ class Conv2dGPTQ:
         self.calibration_batches = 0
         self.candidate_patches = 0
         self.selected_patches = 0
+        self.input_dtypes: dict[str, int] = {}
         self._freed = False
         self._capture_handle = None
 
@@ -144,6 +151,8 @@ class Conv2dGPTQ:
         self.calibration_batches += 1
         self.candidate_patches += total
         self.selected_patches += selected
+        dtype_name = str(inputs.dtype)
+        self.input_dtypes[dtype_name] = self.input_dtypes.get(dtype_name, 0) + 1
 
     def calibration_summary(self) -> dict[str, object]:
         """Return JSON-compatible collection policy and counts, without tensors."""
@@ -155,6 +164,7 @@ class Conv2dGPTQ:
             "max_patches_per_batch": self.max_patches_per_batch,
             "patch_chunk_size": self.patch_chunk_size,
             "columns": self.columns,
+            "input_dtypes_by_batch": dict(self.input_dtypes),
         }
 
     @torch.no_grad()
