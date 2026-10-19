@@ -35,6 +35,7 @@ from typing import Any, Callable
 
 from unet_gptq.domain.data_consistency import validate_dc_weight
 from unet_gptq.diffusion.diagnostics import SamplingDiagnostics
+from unet_gptq.diffusion.model_factory import resolve_model_config
 
 from unet_gptq.domain.forward_operator import channels_to_img, img_to_channels
 from unet_gptq.diffusion.samplers import reconstruct_pair
@@ -175,6 +176,11 @@ def validate_quant_manifest(manifest: dict, fp_hash: str, w4_hash: str) -> None:
     calibration = manifest.get("calibration")
     if not isinstance(calibration, dict) or not calibration.get("description"):
         raise ValueError("W4 manifest requires calibration.description - data split and timestep selection")
+    verification = manifest.get("verification")
+    if (verification is not None or calibration.get("artifact_verification_required")) and (
+        not isinstance(verification, dict) or verification.get("status") != "passed"
+    ):
+        raise ValueError("W4 artifact verification has not passed")
 
 def relative_l2(error: np.ndarray, reference: np.ndarray) -> float | None:
     denominator = float(np.sum(np.abs(reference.astype(np.complex128)) ** 2))
@@ -424,21 +430,10 @@ class TorchBackend:
         self.factory = self.factory_module.create_model_and_two_diffusion
         self.sampler = import_callable(args.sampler)
         self.loader = import_callable(args.w4_loader) if args.w4_loader else None
-        self.config = dict(self.factory_module.model_and_diffusion_defaults())
-        options = json.loads(args.model_options)
-        if not isinstance(options, dict):
-            raise ValueError("--model_options must be a JSON object.")
-        unknown = options.keys() - self.config.keys()
-        if unknown:
-            raise ValueError(f"Unknown model options for this factory: {sorted(unknown)}")
-        for reserved in ("image_size", "timestep_respacing", "use_fp16"):
-            if reserved in options:
-                raise ValueError(f"Set {reserved} via the runner; do not duplicate it in --model_options.")
-        self.config.update(options)
-        self.config["image_size"] = args.image_size
-        self.config["timestep_respacing"] = args.timestep_respacing
-        if "use_fp16" in self.config:
-            self.config["use_fp16"] = args.use_fp16
+        self.config = resolve_model_config(
+            self.factory_module, model_options=args.model_options, image_size=args.image_size,
+            timestep_respacing=args.timestep_respacing, use_fp16=args.use_fp16,
+        )
         if manifest and manifest["format"] == "custom" and self.loader is None:
             raise ValueError("format=custom requires --w4_loader module:function.")
         if self.loader and (manifest is None or manifest["format"] != "custom"):
@@ -684,7 +679,7 @@ def create_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_path", required=True, help="Original FP torch state_dict.")
     parser.add_argument("--w4_model_path", default="", help="Existing GPTQ-W4 artifact; no quantizer is run here.")
-    parser.add_argument("--w4_manifest", default="", help="Provenance JSON from make_w4_manifest.py.")
+    parser.add_argument("--w4_manifest", default="", help="manifest.json from unet_gptq.train.calibrate_gptq.")
     parser.add_argument("--w4_loader", default="", help="module:function for manifest format=custom only.")
     parser.add_argument("--conditions", nargs="+", choices=("fp", "w4"), default=["fp", "w4"])
     parser.add_argument("--data_root", required=True)

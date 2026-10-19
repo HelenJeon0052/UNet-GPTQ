@@ -8,6 +8,15 @@ This project studies how GPTQ weight quantization affects reconstruction quality
 
 > **Implementation status:** this README specifies the proposed repository layout, experiment protocol, and command-line interfaces. The listed modules and commands are implementation targets; this document does not establish that they are implemented or that experiments have been completed.
 
+**Implemented calibration entry point:** `python -m unet_gptq.train.calibrate_gptq`
+connects `Conv2dGPTQ` to the DiffuseRecon factory and writes `weights_w4.pt`,
+`quantization.pt`, and `manifest.json` for `unet_gptq.train.run_exp`.
+See [GPTQ calibration and validation](docs/gptq_calibration.md) for the executable
+commands, calibration split/timestep policy, exclusions, and CPU test scope.
+The artifact simulates W4 weights with floating-point convolution; it does not
+implement packed INT4 inference. Real-checkpoint reconstruction results are not
+established by the CPU integration tests.
+
 ## Research Questions
 
 1. **Weight quantization:** How much does GPTQ W4A16 change MRI reconstruction quality relative to the original FP16 model under identical reconstruction conditions?
