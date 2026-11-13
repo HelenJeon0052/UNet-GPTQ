@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+build/
+dist/
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.hdf5
+*.pkl
+*.npz
+outputs/
+artifacts/
+configs/paired_local.json

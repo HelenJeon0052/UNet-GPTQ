@@ -6,7 +6,23 @@ This project studies how GPTQ weight quantization affects reconstruction quality
 
 **First milestone:** automate the paired **FP16 vs. GPTQ W4A16** comparison. Add activation-precision experiments only after the baseline is reproducible.
 
-> **Implementation status:** this README specifies the proposed repository layout, experiment protocol, and command-line interfaces. The listed modules and commands are implementation targets; this document does not establish that they are implemented or that experiments have been completed.
+> **Implementation status:** the existing pilot, FP/W4 runner, Conv2d GPTQ
+> calibration, shared JSON controls, and FP overlap-comparison prototype are
+> implemented. The repository layout and `scripts/` commands below remain
+> proposed targets. Implementation does not establish real-checkpoint,
+> real-MRI, CUDA, FLAIR suitability, or published-baseline validation.
+
+For the implemented commands and their input contracts, see
+[paired reconstruction and FP protocol comparison](docs/paired_reconstruction.md).
+
+**Implemented calibration entry point:** `python -m unet_gptq.train.calibrate_gptq`
+connects `Conv2dGPTQ` to the DiffuseRecon factory and writes `weights_w4.pt`,
+`quantization.pt`, and `manifest.json` for `unet_gptq.train.run_exp`.
+See [GPTQ calibration and validation](docs/gptq_calibration.md) for the executable
+commands, calibration split/timestep policy, exclusions, and CPU test scope.
+The artifact simulates W4 weights with floating-point convolution; it does not
+implement packed INT4 inference. Real-checkpoint reconstruction results are not
+established by the CPU integration tests.
 
 ## Research Questions
 

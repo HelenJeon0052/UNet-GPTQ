@@ -7,7 +7,6 @@ import argparse
 import pickle
 
 import numpy as np
-import matplotlib.pyplot as plt
 from pathlib import Path
 import csv
 import json
@@ -301,6 +300,7 @@ def load_saved(path: str | Path) -> tuple[dict[str, np.ndarray], dict[str, Any]]
         "condition": condition, "seed": seed, "dc_weight": args.get("dc_weight"),
         "precision": precision, "coarse_steps": args.get("coarse_steps", args.get("timestep_respacing")),
         "refine_steps": args.get("refine_steps"),
+        "clip_denoised": args.get("clip_denoised"), "model_init_seed": args.get("model_init_seed"),
         "num_samples": args.get("num_samples", 1 if schema == "consolidated" and manifest else None),
         "checkpoint_sha256": manifest.get("checkpoint_sha256", manifest.get("fp_checkpoint_sha256")),
         "model_config": config,
@@ -614,7 +614,7 @@ def main(argv: list[str] | None = None) -> int:
         summary_rows.extend({**identity, **row} for row in result["stages"])
         comparison = compare_inputs(loaded[0][0], arrays, args.tolerance)
         difference, unknown = [], []
-        for key in ("checkpoint_sha256", "model_config", "seed", "coarse_steps", "refine_steps", "precision", "num_samples", "dc_weight"):
+        for key in ("checkpoint_sha256", "model_config", "seed", "model_init_seed", "coarse_steps", "refine_steps", "clip_denoised", "precision", "num_samples", "dc_weight"):
             left, right = loaded[0][1][key], meta[key]
             if left is None or right is None:
                 unknown.append(key)
@@ -649,4 +649,4 @@ def main(argv: list[str] | None = None) -> int:
         for file in sorted(out.rglob("*")):
             if file.is_file() and file.name != "analysis_bundle.zip":
                 archive.write(file, file.relative_to(out))
-    print(f"Saved: {out}") 
+    print(f"Saved: {out}")

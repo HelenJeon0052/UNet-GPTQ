@@ -1,0 +1,32 @@
+{
+  "checkpoint": "/path/to/ema_0.9999_150000.pt",
+  "image_size": 320,
+  "model_options": {
+    "num_channels": 128,
+    "num_res_blocks": 3,
+    "learn_sigma": false,
+    "dropout": 0.3,
+    "diffusion_steps": 4000,
+    "noise_schedule": "cosine"
+  },
+  "mask": {"path": "/path/to/mask_centered.pkl", "layout": "centered"},
+  "sampling": {
+    "coarse_steps": 100,
+    "refine_steps": 20,
+    "num_samples": 1,
+    "seed": 0,
+    "model_init_seed": 0,
+    "dc_weight": 1.0,
+    "clip_denoised": true
+  },
+  "execution": {"device": "cuda:0", "precision": "fp16"},
+  "data": {
+    "h5": "/path/to/evaluation.h5",
+    "data_root": "/path/to/exported_pair",
+    "file1": "slice16.pkl",
+    "file2": "slice17.pkl",
+    "slice_index": 16,
+    "before": "slice15.pkl",
+    "after": "slice18.pkl"
+  }
+}

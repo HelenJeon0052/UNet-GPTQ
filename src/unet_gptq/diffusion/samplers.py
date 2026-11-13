@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from unet_gptq.domain.data_consistency import prepare_mask, project_observations, validate_dc_weight
 from unet_gptq.domain.forward_operator import channels_to_img, img_to_channels
 from unet_gptq.datas.fastmri_dataset import fft2_unshifted
+from unet_gptq.diffusion.aggregation import overlapping_pair_components
 
 if TYPE_CHECKING:
     from .diagnostics import SamplingDiagnostics
@@ -135,4 +136,46 @@ def reconstruct_pair(
 
 
     return channels_to_img(mean), result
+
+
+@torch.inference_mode()
+def reconstruct_adjacent_aggregate(
+    model, coarse_diffusion, refine_diffusion, four_observed_slices, mask, *,
+    num_samples=1, refine_steps=20, clip_denoised=True, dc_weight=1.0,
+):
+    """FP comparison: aggregate three overlapping pairs then refine the center.
+
+    ``four_observed_slices`` is complex [B,4,H,W] in order i-1,i,i+1,i+2.
+    The central pair runs first so resetting the same RNG state before the
+    single-pair run produces the same central coarse trajectory. This follows
+    the upstream overlap idea but runs samples sequentially, not in the
+    upstream batch layout; it is not claimed to be bitwise upstream parity.
+    """
+    if (not torch.is_tensor(four_observed_slices) or four_observed_slices.ndim != 4
+            or four_observed_slices.shape[1] != 4 or not torch.is_complex(four_observed_slices)):
+        raise ValueError("Expected four complex observed slices [B,4,H,W]")
+    if type(num_samples) is not int or num_samples < 1:
+        raise ValueError("num_samples must be a positive integer")
+    if type(refine_steps) is not int or not 0 <= refine_steps <= refine_diffusion.num_timesteps:
+        raise ValueError("refine_steps must be within the refinement schedule")
+    if coarse_diffusion.num_timesteps < 1:
+        raise ValueError("The coarse schedule must contain at least one step")
+    dc_weight = validate_dc_weight(dc_weight)
+    observed = four_observed_slices.to(torch.complex64)
+    mask = prepare_mask(mask, observed[:, 1:3])
+    pair_means = [None, None, None]
+    for pair_index in (1, 0, 2):
+        pair = observed[:, pair_index:pair_index + 2]
+        total = None
+        for sample_index in range(num_samples):
+            sample = _coarse_pass(model, coarse_diffusion, pair, mask,
+                                  clip_denoised=clip_denoised, dc_weight=dc_weight,
+                                  diagnostics=None, sample_index=sample_index)
+            total = sample if total is None else total + sample
+        pair_means[pair_index] = total / num_samples
+    aggregate = torch.cat(overlapping_pair_components(pair_means), dim=1)
+    refined = _refine_pass(model, refine_diffusion, aggregate, observed[:, 1:3], mask,
+                           refine_steps, clip_denoised=clip_denoised,
+                           dc_weight=dc_weight, diagnostics=None)
+    return channels_to_img(aggregate), channels_to_img(refined), channels_to_img(pair_means[1])
 

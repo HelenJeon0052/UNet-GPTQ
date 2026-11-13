@@ -35,12 +35,16 @@ from typing import Any, Callable
 
 from unet_gptq.domain.data_consistency import validate_dc_weight
 from unet_gptq.diffusion.diagnostics import SamplingDiagnostics
+from unet_gptq.diffusion.model_factory import resolve_model_config
+from unet_gptq.metrics.quality import slice_quality
+from unet_gptq.experiment_config import parse_with_shared_config
+from unet_gptq.split_integrity import check_calibration_separation
 
 from unet_gptq.domain.forward_operator import channels_to_img, img_to_channels
 from unet_gptq.diffusion.samplers import reconstruct_pair
 
 STAGES = ("coarse", "refined")
-QUALITY_KEYS = ("magnitude_nmse", "magnitude_rmse", "psnr_db", "dc_relative_l2")
+QUALITY_KEYS = ("magnitude_nmse", "complex_nmse", "magnitude_rmse", "psnr_db", "dc_relative_l2")
 
 def sha256_file(path:str | Path) -> str:
     digest = hashlib.sha256()
@@ -175,6 +179,11 @@ def validate_quant_manifest(manifest: dict, fp_hash: str, w4_hash: str) -> None:
     calibration = manifest.get("calibration")
     if not isinstance(calibration, dict) or not calibration.get("description"):
         raise ValueError("W4 manifest requires calibration.description - data split and timestep selection")
+    verification = manifest.get("verification")
+    if (verification is not None or calibration.get("artifact_verification_required")) and (
+        not isinstance(verification, dict) or verification.get("status") != "passed"
+    ):
+        raise ValueError("W4 artifact verification has not passed")
 
 def relative_l2(error: np.ndarray, reference: np.ndarray) -> float | None:
     denominator = float(np.sum(np.abs(reference.astype(np.complex128)) ** 2))
@@ -203,18 +212,13 @@ def quality_rows(outputs: dict, case: Case, seed: int, condition: str) -> list[d
             for pair_index, estimate in enumerate(sample):
                 target = case.reference[0, pair_index].astype(np.complex128)
                 estimate = estimate.astype(np.complex128)
-                magnitude = np.abs(target)
-                difference = np.abs(estimate) - magnitude
-                mse = float(np.mean(difference**2))
-                peak = float(magnitude.max())
-                psnr = 10 * math.log10(peak**2 / mse) if mse > 0 else None
+                quality = slice_quality(estimate, target)
                 measured = case.observed[0, pair_index]
                 residual = case.mask[0, pair_index] * np.fft.fft2(estimate) - measured
                 rows.append({
                     "seed": seed, "condition": condition, "stage": stage, 
                     "sample_index": sample_id, "pair_index": pair_index,
-                    "magnitude_nmse": float(np.sum(difference**2)) / np.sum(magnitude**2),
-                    "magnitude_rmse": math.sqrt(mse), "psnr_db": psnr, "psnr_is_posinf": mse == 0, "data_range": peak, "dc_relative_l2": relative_l2(residual, measured)
+                    **quality, "dc_relative_l2": relative_l2(residual, measured)
                 })
     
     return rows
@@ -424,21 +428,10 @@ class TorchBackend:
         self.factory = self.factory_module.create_model_and_two_diffusion
         self.sampler = import_callable(args.sampler)
         self.loader = import_callable(args.w4_loader) if args.w4_loader else None
-        self.config = dict(self.factory_module.model_and_diffusion_defaults())
-        options = json.loads(args.model_options)
-        if not isinstance(options, dict):
-            raise ValueError("--model_options must be a JSON object.")
-        unknown = options.keys() - self.config.keys()
-        if unknown:
-            raise ValueError(f"Unknown model options for this factory: {sorted(unknown)}")
-        for reserved in ("image_size", "timestep_respacing", "use_fp16"):
-            if reserved in options:
-                raise ValueError(f"Set {reserved} via the runner; do not duplicate it in --model_options.")
-        self.config.update(options)
-        self.config["image_size"] = args.image_size
-        self.config["timestep_respacing"] = args.timestep_respacing
-        if "use_fp16" in self.config:
-            self.config["use_fp16"] = args.use_fp16
+        self.config = resolve_model_config(
+            self.factory_module, model_options=args.model_options, image_size=args.image_size,
+            timestep_respacing=args.timestep_respacing, use_fp16=args.use_fp16,
+        )
         if manifest and manifest["format"] == "custom" and self.loader is None:
             raise ValueError("format=custom requires --w4_loader module:function.")
         if self.loader and (manifest is None or manifest["format"] != "custom"):
@@ -505,9 +498,12 @@ class TorchBackend:
         
         model.load_state_dict(state, strict=True)
 
+        quantized_numel = sum(parameters[name].numel() for name in names)
+        total_numel = sum(value.numel() for value in parameters.values())
         return {"format": "dequantized_state_dict", "changed_quantized_parameters": changed,
-                "declared_quantized_numel": sum(parameters[name].numel() for name in names),
-                "total_parameter_numel": sum(value.numel() for value in parameters.values()),
+                "declared_quantized_numel": quantized_numel,
+                "total_parameter_numel": total_numel,
+                "declared_quantized_parameter_fraction": quantized_numel / total_numel,
                 "packed_int4_execution": False,
                 "verification": "state differences checked; GPTQ method/bitwidth are artifact-producer declarations"}
         
@@ -682,17 +678,18 @@ class TorchBackend:
 
 def create_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model_path", required=True, help="Original FP torch state_dict.")
+    parser.add_argument("--config", help="Shared JSON experiment config; CLI options override it.")
+    parser.add_argument("--model_path", help="Original FP torch state_dict.")
     parser.add_argument("--w4_model_path", default="", help="Existing GPTQ-W4 artifact; no quantizer is run here.")
-    parser.add_argument("--w4_manifest", default="", help="Provenance JSON from make_w4_manifest.py.")
+    parser.add_argument("--w4_manifest", default="", help="manifest.json from unet_gptq.train.calibrate_gptq.")
     parser.add_argument("--w4_loader", default="", help="module:function for manifest format=custom only.")
     parser.add_argument("--conditions", nargs="+", choices=("fp", "w4"), default=["fp", "w4"])
-    parser.add_argument("--data_root", required=True)
+    parser.add_argument("--data_root")
     parser.add_argument("--image", default="")
     parser.add_argument("--slice_index", type=int, default=0)
     parser.add_argument("--file1", default="", help="Override the first legacy filename; relative to data_root.")
     parser.add_argument("--file2", default="", help="Override the second legacy filename; relative to data_root.")
-    parser.add_argument("--mask_path", required=True)
+    parser.add_argument("--mask_path")
     parser.add_argument("--mask_layout", choices=("unshifted", "centered"), default="unshifted")
     parser.add_argument("--save_path", required=True, help="A NEW directory; existing output directories are rejected.")
     parser.add_argument("--image_size", type=int, default=320)
@@ -708,17 +705,22 @@ def create_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--repeat_rtol", type=float, default=0.0)
     parser.add_argument("--allow_nondeterministic", action="store_true")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--use_fp16", action="store_true", help="Use the model's convert_to_fp16 for BOTH conditions.")
+    parser.add_argument("--use_fp16", action=argparse.BooleanOptionalAction, default=False, help="Use the model's convert_to_fp16 for BOTH conditions.")
     parser.add_argument("--factory_module", default="improved_diffusion.script_util_duo")
     parser.add_argument("--sampler", default="unet_gptq.diffusion.samplers:reconstruct_pair")
     parser.add_argument("--model_options", default="{}", help="JSON overrides of the pretrained model/factory defaults.")
-    parser.add_argument("--timestep_respacing", default="")
+    parser.add_argument("--timestep_respacing", default="100")
+    parser.add_argument("--eval_patient_id", default="")
+    parser.add_argument("--eval_exam_id", default="")
+    parser.add_argument("--require_split_validation", action="store_true", help="Reject W4 if patient/exam separation cannot be established.")
     return parser
 
 
 def validate_args(args: argparse.Namespace) -> None:
 
     validate_dc_weight(args.dc_weight)
+    if not (args.model_path and args.data_root and args.mask_path):
+        raise ValueError("model_path, data_root and mask_path are required via CLI or --config")
     if "fp" not in args.conditions or len(set(args.conditions)) != len(args.conditions):
         raise ValueError("Conditions must include fp, without duplicates.")
     if len(set(args.seeds)) != len(args.seeds) or any(not 0 <= seed < 2 ** 32 for seed in [*args.seeds, args.model_init_seed]):
@@ -737,7 +739,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = create_argparser().parse_args(argv)
+    args, shared_config = parse_with_shared_config(create_argparser(), argv, "comparison")
     validate_args(args)
     out = Path(args.save_path).resolve()
     if out.exists():
@@ -745,13 +747,29 @@ def main(argv: list[str] | None = None) -> int:
     case, input_info = load_case(args)
     fp_hash = sha256_file(args.model_path)
     quant_manifest = None
+    split_validation = {"status": "not_applicable", "reason": "no quantized condition"}
     if "w4" in args.conditions:
         quant_manifest = json.loads(Path(args.w4_manifest).read_text(encoding="utf-8"))
         validate_quant_manifest(quant_manifest, fp_hash, sha256_file(args.w4_model_path))
+        split_validation = check_calibration_separation(
+            quant_manifest.get("calibration"),
+            evaluation_files=[item["sha256"] for item in input_info["image_files"]],
+            patient_id=args.eval_patient_id, exam_id=args.eval_exam_id,
+        )
+        if args.require_split_validation and split_validation["status"] != "verified":
+            raise ValueError("Calibration/evaluation separation could not be verified; provide matching IDs in manifests")
+        if split_validation["status"] != "verified":
+            print("WARNING: calibration/evaluation patient or examination separation is unverified.",
+                  file=sys.stderr, flush=True)
     backend = TorchBackend(args, case, quant_manifest)
     provenance = {"schema_version": 1, "started_utc": datetime.now(timezone.utc).isoformat(),
                   "arguments": vars(args), "fp_checkpoint_sha256": fp_hash,
                   "input": input_info, "w4_artifact": quant_manifest,
+                  "shared_config": shared_config["config_provenance"] if shared_config else None,
+                  "split_validation": split_validation,
+                  "protocol": "single_pair_average_then_refine",
+                  "measurement_model": "synthetic_singlecoil_from_combined_reference",
+                  "channel_order": ["Re(slice1)", "Im(slice1)", "Re(slice2)", "Im(slice2)"],
                   "environment": backend.metadata(), "runner": source_info(sys.modules[__name__]),
                   "noise_contract": "same seed restored after each fresh model load; global Python/NumPy/Torch RNG only",
                   "per_step_noise_verified": False}
