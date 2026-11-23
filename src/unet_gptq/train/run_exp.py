@@ -38,9 +38,11 @@ from unet_gptq.diffusion.diagnostics import SamplingDiagnostics
 
 from unet_gptq.domain.forward_operator import channels_to_img, img_to_channels
 from unet_gptq.diffusion.samplers import reconstruct_pair
+from unet_gptq.metrics.quality import METRIC_SCHEMA_VERSION, slice_quality
 
 STAGES = ("coarse", "refined")
-QUALITY_KEYS = ("magnitude_nmse", "magnitude_rmse", "psnr_db", "dc_relative_l2")
+QUALITY_KEYS = ("magnitude_nmse", "complex_nmse", "magnitude_rmse",
+                "magnitude_psnr_db", "psnr_db", "dc_relative_l2")
 
 def sha256_file(path:str | Path) -> str:
     digest = hashlib.sha256()
@@ -203,18 +205,17 @@ def quality_rows(outputs: dict, case: Case, seed: int, condition: str) -> list[d
             for pair_index, estimate in enumerate(sample):
                 target = case.reference[0, pair_index].astype(np.complex128)
                 estimate = estimate.astype(np.complex128)
-                magnitude = np.abs(target)
-                difference = np.abs(estimate) - magnitude
-                mse = float(np.mean(difference**2))
-                peak = float(magnitude.max())
-                psnr = 10 * math.log10(peak**2 / mse) if mse > 0 else None
+                quality = slice_quality(estimate, target)
                 measured = case.observed[0, pair_index]
                 residual = case.mask[0, pair_index] * np.fft.fft2(estimate) - measured
                 rows.append({
                     "seed": seed, "condition": condition, "stage": stage, 
-                    "sample_index": sample_id, "pair_index": pair_index,
-                    "magnitude_nmse": float(np.sum(difference**2)) / np.sum(magnitude**2),
-                    "magnitude_rmse": math.sqrt(mse), "psnr_db": psnr, "psnr_is_posinf": mse == 0, "data_range": peak, "dc_relative_l2": relative_l2(residual, measured)
+                    "sample_index": sample_id, "pair_index": pair_index, "slice_in_pair": pair_index,
+                    **quality,
+                    # Legacy alias: a non-finite PSNR was represented by a blank value.
+                    "psnr_db": quality["magnitude_psnr_db"] if math.isfinite(quality["magnitude_psnr_db"]) else None,
+                    "psnr_is_posinf": quality["magnitude_psnr_status"] == "positive_infinity",
+                    "dc_relative_l2": relative_l2(residual, measured),
                 })
     
     return rows
@@ -241,12 +242,15 @@ def paired_rows(fp_rows: list[dict], w4_rows: list[dict], eligible: bool) -> lis
     result = []
     for w4 in w4_rows:
         fp = lookup[key(w4)]
-        row = {name: w4[name] for name in ("seed", "stage", "sample_index", "pair_index")}
+        row = {name: w4[name] for name in ("seed", "stage", "sample_index", "pair_index", "metric_schema_version")}
         row["eligible"] = eligible
+        for status in ("nmse_status", "magnitude_psnr_status"):
+            row[status + "_fp"], row[status + "_w4"] = fp[status], w4[status]
         for name in QUALITY_KEYS:
             row[name + "_fp"] = fp[name]
             row[name + "_w4"] = w4[name]
-            row["delta_" + name] = None if fp[name] is None or w4[name] is None else w4[name] - fp[name]
+            finite = all(value is not None and math.isfinite(value) for value in (fp[name], w4[name]))
+            row["delta_" + name] = w4[name] - fp[name] if finite else None
         result.append(row)
     return result
 
@@ -263,15 +267,17 @@ def summarize_pairs(rows: list[dict]) -> dict:
             for row in stage_rows:
                 groups.setdefault(row["seed"], []).append(row[name])
             # A partially undefined seed (e.g. infinite PSNR) is not silently averaged.
-            means = {str(seed): float(np.mean(values)) for seed, values in groups.items()
-                     if all(value is not None for value in values)}
-            values = list(means.values())
+            means = {str(seed): (float(np.mean(values)) if all(value is not None for value in values) else None)
+                     for seed, values in groups.items()}
+            values = [value for value in means.values() if value is not None]
+            complete = bool(groups) and len(values) == len(groups)
             metrics[name] = {"by_seed": means, "n_seeds": len(values),
                              "n_undefined_seeds": len(groups) - len(values),
-                             "mean": float(np.mean(values)) if values else None,
-                             "std_across_seeds": float(np.std(values, ddof=1)) if len(values) > 1 else None}
+                             "mean": float(np.mean(values)) if complete else None,
+                             "std_across_seeds": float(np.std(values, ddof=1)) if complete and len(values) > 1 else None}
         summary[stage] = metrics
-    return {"delta_direction": "W4 - FP", "aggregation": "mean over samples and pair images within seed, then over seeds",
+    return {"metric_schema_version": METRIC_SCHEMA_VERSION,
+            "delta_direction": "W4 - FP", "aggregation": "mean over samples and pair images within seed, then over seeds; no partial average for undefined deltas",
             "inference_scope": "seed variability for one input pair; not patient-level confidence intervals",
             "stages": summary}
 
@@ -712,7 +718,7 @@ def create_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--factory_module", default="improved_diffusion.script_util_duo")
     parser.add_argument("--sampler", default="unet_gptq.diffusion.samplers:reconstruct_pair")
     parser.add_argument("--model_options", default="{}", help="JSON overrides of the pretrained model/factory defaults.")
-    parser.add_argument("--timestep_respacing", default="")
+    parser.add_argument("--timestep_respacing", default="100", help="Passed unchanged to the factory; default=100 is a pilot value.")
     return parser
 
 
@@ -749,7 +755,8 @@ def main(argv: list[str] | None = None) -> int:
         quant_manifest = json.loads(Path(args.w4_manifest).read_text(encoding="utf-8"))
         validate_quant_manifest(quant_manifest, fp_hash, sha256_file(args.w4_model_path))
     backend = TorchBackend(args, case, quant_manifest)
-    provenance = {"schema_version": 1, "started_utc": datetime.now(timezone.utc).isoformat(),
+    provenance = {"schema_version": 1, "metric_schema_version": METRIC_SCHEMA_VERSION,
+                  "started_utc": datetime.now(timezone.utc).isoformat(),
                   "arguments": vars(args), "fp_checkpoint_sha256": fp_hash,
                   "input": input_info, "w4_artifact": quant_manifest,
                   "environment": backend.metadata(), "runner": source_info(sys.modules[__name__]),
