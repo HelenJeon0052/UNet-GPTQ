@@ -241,7 +241,7 @@ def save_reconstruction(output: str | Path, *, reference: torch.Tensor, observed
 
 def run_pilot(ckpt: str | Path, h5: str | Path, *, out: str | Path = Path.home() / "unet_gptq_runs",
               slice_index: int = 7, crop_size: int = 320, acs_width: int = 24,
-              acceleration: float = 4, center_fraction: float = 0.08, seed: int = 0,
+              acceleration: float = 4, center_fraction: float = 0.08, seed: int = 1,
               coarse_steps: int = 100, refine_steps: int = 20, dc_weight: float = 1.0,
               device: str = "cuda:0", precision: str = "fp16", model_config: str | Path | None = None,
               deterministic: bool = True, progress: bool = True, plot: bool = False,
@@ -319,7 +319,9 @@ def run_pilot(ckpt: str | Path, h5: str | Path, *, out: str | Path = Path.home()
             mask=mask, scale=scale, slice_index=slice_index)
         result = analyze_run(npz_path, plot=plot)
         manifest.update(status="COMPLETED", input_checks=result["input_checks"],
-                        outputs=["reconstruction.npz", "metrics.csv", "metrics_summary.json"] + (["comparison.png"] if plot else []))
+                        metric_schema_version=result["metric_schema_version"],
+                        outputs=["reconstruction.npz", "metrics_v2.csv", "stage_summary_v2.csv",
+                                 "metrics_summary_v2.json"] + (["comparison.png"] if plot else []))
         save_manifest()
     except Exception as exc:
         manifest.update(status="FAILED", error=f"{type(exc).__name__}: {exc}")
@@ -342,7 +344,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--acs-width", type=int, default=24)
     parser.add_argument("--acceleration", type=float, default=4)
     parser.add_argument("--center-fraction", type=float, default=0.08)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--coarse-steps", type=int, default=100)
     parser.add_argument("--refine-steps", type=int, default=20)
     parser.add_argument("--dc-weight", type=float, default=0.5)
