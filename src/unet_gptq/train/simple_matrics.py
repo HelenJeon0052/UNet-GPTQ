@@ -17,6 +17,16 @@ import pickle
 from typing import Any
 from datetime import datetime, timezone
 
+try:
+    from unet_gptq.metrics.quality import METRIC_SCHEMA_VERSION, slice_quality, summarize_slice_quality
+except ModuleNotFoundError as exc:
+    # Preserve direct execution of this standalone script from an uninstalled checkout.
+    if exc.name != "unet_gptq":
+        raise
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from unet_gptq.metrics.quality import METRIC_SCHEMA_VERSION, slice_quality, summarize_slice_quality
+
 AXES = (-2, -1)
 STAGES = ("zero_filled", "coarse", "reconstruction")
 
@@ -52,25 +62,14 @@ def relative_l2(value: Any, reference: Any) -> float:
 
 
 def nmse(value: Any, reference: Any, *, magnitude: bool = True) -> float:
-    """Squared relative error. Magnitude NMSE ignores complex phase."""
-    value, reference = _matched(value, reference)
-    if magnitude:
-        value, reference = np.abs(value), np.abs(reference)
-    return _ratio(float(np.sum(np.abs(value - reference) ** 2, dtype=np.float64)),
-                  float(np.sum(np.abs(reference) ** 2, dtype=np.float64)))
+    """Per-slice NMSE; magnitude NMSE ignores complex phase."""
+    name = "magnitude_nmse" if magnitude else "complex_nmse"
+    return slice_quality(value, reference)[name]
 
 
 def psnr(value: Any, reference: Any) -> float:
     """Magnitude PSNR in dB, using this reference slice's maximum as peak."""
-    value, reference = _matched(value, reference)
-    value, reference = np.abs(value), np.abs(reference)
-    mse = float(np.mean((value - reference) ** 2))
-    peak = float(reference.max())
-    if mse == 0:
-        return float("inf")
-    if peak == 0:
-        return float("-inf")
-    return float(20 * np.log10(peak) - 10 * np.log10(mse))
+    return slice_quality(value, reference)["magnitude_psnr_db"]
 
 def resolve_npz(path: str | Path) -> Path:
     path = Path(path).expanduser().resolve()
@@ -153,10 +152,7 @@ def compute_metrics(arrays: dict[str, np.ndarray]) -> list[dict[str, Any]]:
                 rows.append({
                     "stage": stage, "pair_index": pair, "slice_in_pair": slot,
                     "slice_index": slice_index,
-                    "magnitude_nmse": nmse(image, target),
-                    "complex_nmse": nmse(image, target, magnitude=False),
-                    "magnitude_rmse": float(np.sqrt(np.mean((np.abs(image.astype(np.complex128)) - np.abs(target.astype(np.complex128))) ** 2))),
-                    "magnitude_psnr_db": psnr(image, target),
+                    **slice_quality(image, target),
                     "dc_relative_l2": relative_l2(mask * np.fft.fft2(image, norm="backward"), observed),
                 })
     return rows
@@ -418,13 +414,13 @@ def stage_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result = []
     for stage in STAGES:
         group = [row for row in rows if row["stage"] == stage]
-        summary = {"stage": stage, "n_slice_rows": len(group)}
-        for name in METRICS:
-            values = np.asarray([row[name] for row in group], dtype=float)
-            # Do not silently drop +/-inf PSNR (exact reconstruction/zero target).
-            with np.errstate(invalid="ignore"):
-                summary[name + "_mean"] = float(np.mean(values))
-            summary[name + "_nonfinite_count"] = int((~np.isfinite(values)).sum())
+        summary = {"stage": stage, "n_slice_rows": len(group),
+                   "metric_schema_version": METRIC_SCHEMA_VERSION,
+                   **summarize_slice_quality(group)}
+        values = np.asarray([row["dc_relative_l2"] for row in group], dtype=float)
+        with np.errstate(invalid="ignore"):
+            summary["dc_relative_l2_mean"] = float(np.mean(values))
+        summary["dc_relative_l2_nonfinite_count"] = int((~np.isfinite(values)).sum())
         result.append(summary)
     return result
 
@@ -436,15 +432,16 @@ def analyze_run(path: str | Path, *, output_dir: str | Path | None = None,
     rows = compute_metrics(arrays)
     out = Path(meta["npz_path"]).parent if output_dir is None else Path(output_dir).expanduser().resolve()
     out.mkdir(parents=True, exist_ok=True)
-    _write_csv(out / "metrics.csv", rows)
+    _write_csv(out / "metrics_v2.csv", rows)
     summaries = stage_summary(rows)
-    _write_csv(out / "stage_summary.csv", summaries)
-    summary = {**meta, "input_checks": checks, "num_metric_rows": len(rows),
+    _write_csv(out / "stage_summary_v2.csv", summaries)
+    summary = {**meta, "metric_schema_version": METRIC_SCHEMA_VERSION,
+               "input_checks": checks, "num_metric_rows": len(rows),
                "fft": "unshifted/backward", "psnr_peak": "per-reference-slice magnitude maximum",
                "aggregation": "arithmetic mean across saved batch/slice rows; not independent subjects",
-               "zero_reference_policy": "relative errors are 0 for identical zeros, otherwise inf",
+               "zero_reference_policy": "image NMSE and PSNR are undefined (NaN); DC relative L2 uses its own policy",
                "stages": summaries}
-    _write_json(out / "metrics_summary.json", summary)
+    _write_json(out / "metrics_summary_v2.json", summary)
     if plot:
         for batch in range(arrays["reference"].shape[0]):
             plot_run(arrays, out / ("comparison.png" if batch == 0 else f"comparison_batch{batch}.png"), pair_index=batch)
@@ -525,6 +522,147 @@ def write_report(results: list[dict], comparisons: list[dict], out: Path) -> Non
               "- figures/: --plot 사용 시 비교 그림. 같은 실행의 모든 stage에서 동일한 magnitude/error 색 범위를 사용합니다.", ""]
     (out / "report.md").write_text("\n".join(lines), encoding="utf-8")
 
+
+def write_report_en(results: list[dict], comparisons: list[dict], out: Path) -> None:
+    lines = [
+        "# FP Reconstruction Comparison by Run",
+        "",
+        (
+            "The metrics below were recalculated from the saved NPZ files. "
+            "Each run and seed is reported separately. Stage summaries use "
+            "an equally weighted mean across slice rows in each file."
+        ),
+        "",
+        (
+            "| Run | α | Seed | Precision | ZF NMSE | Coarse NMSE | "
+            "Final NMSE | Final / ZF | Final PSNR (dB) | Final DC relative L2 |"
+        ),
+        "|---|---:|---:|---|---:|---:|---:|---:|---:|---:|",
+    ]
+
+    for result in results:
+        stages = {row["stage"]: row for row in result["stages"]}
+
+        zf, coarse, final = (
+            stages[stage]["magnitude_nmse_mean"]
+            for stage in STAGES
+        )
+
+        change = (
+            "not comparable to the zero-filled result due to a non-finite metric"
+            if not np.isfinite([final, zf]).all()
+            else "lower than the zero-filled result"
+            if final < zf
+            else "higher than the zero-filled result"
+            if final > zf
+            else "equal to the zero-filled result"
+        )
+
+        reduction = 100 * (1 - final / coarse) if coarse > 0 else None
+        reduction_text = (
+            "not available"
+            if reduction is None
+            else f"{_fmt(reduction)}%"
+        )
+
+        runtime = (
+            "not recorded"
+            if result["inference_seconds"] is None
+            else f"{_fmt(result['inference_seconds'])} seconds"
+        )
+
+        lines.append(
+            f"- {result['label']}: Final magnitude NMSE is {change}. "
+            f"NMSE reduction from coarse to final: {reduction_text}. "
+            f"Recorded sampling time: {runtime}."
+        )
+
+    lines += ["", "## Comparison Conditions", ""]
+
+    for item in comparisons:
+        lines.append(
+            f"- {item['label']} ↔ {results[0]['label']}: "
+            f"`{item['relation']}`. "
+            f"Configuration differences: "
+            f"{', '.join(item['configuration_differences']) or 'none identified'}. "
+            f"Unverified settings: "
+            f"{', '.join(item['configuration_unknown']) or 'none'}."
+        )
+
+    lines += [
+        "",
+        "## Metric Definitions and Interpretation",
+        "",
+        (
+            "- Magnitude NMSE = Σ(|reconstruction| − |reference|)² "
+            "/ Σ|reference|². Lower is better."
+        ),
+        (
+            "- Complex NMSE = Σ|reconstruction − reference|² "
+            "/ Σ|reference|². Each run uses its saved reference with the "
+            "same convention."
+        ),
+        (
+            "- PSNR is calculated in dB for each slice using the maximum "
+            "reference magnitude as the peak. The summary is the arithmetic "
+            "mean of the per-slice PSNR values."
+        ),
+        (
+            "- DC relative L2 = ||M FFT(reconstruction) − observed||₂ "
+            "/ ||observed||₂. A low value alone does not guarantee "
+            "reconstruction quality in unobserved regions."
+        ),
+        (
+            "- The FFT was verified using the unshifted/backward convention. "
+            "The normalization scale saved with the run was not adjusted "
+            "afterward."
+        ),
+        (
+            "- The reference in this pipeline is a combined complex image; "
+            "fastMRI reconstruction_rss is not used as the evaluation target. "
+            "The measurements are synthetic single-coil measurements "
+            "generated from the combined image."
+        ),
+        (
+            "- Adjacent slices and different stages are not counted as "
+            "independent patients or independent repetitions. No confidence "
+            "intervals or significance tests are applied to this table."
+        ),
+        (
+            "- checkerboard_equivalent means that the transformation "
+            "relationship among the input, observations, and mask was "
+            "verified. It does not establish compatibility with the "
+            "checkpoint's training convention."
+        ),
+        (
+            "- Differences between runs with different inputs or "
+            "checkpoint/seed/step/precision settings cannot be attributed "
+            "solely to the DC weight."
+        ),
+        (
+            "- Runtime is the recorded value for each run. It is a single "
+            "measurement without warm-up. The timing policy, including "
+            "whether the inspect_utils progress hook was included, is "
+            "preserved in provenance.json."
+        ),
+        (
+            "- Coarse and final outputs were not renormalized to match "
+            "the ground truth. This tool does not calculate SSIM."
+        ),
+        "",
+        "## Output Files",
+        "",
+        "- per_slice_metrics.csv: metrics for each run, slice, and stage",
+        "- comparison_summary.csv: mean metrics and recorded settings by run and stage",
+        "- provenance.json: original paths/SHA256 hashes, manifests, input checks, and comparison conditions",
+        "- figures/: comparison figures generated when --plot is used. The same magnitude and error color ranges are used across stages within each run.",
+        "",
+    ]
+
+    (out / "report.md").write_text(
+        "\n".join(lines),
+        encoding="utf-8",
+    )
 
 def plot_summary(results: list[dict], out: Path) -> None:
     import matplotlib
@@ -630,7 +768,8 @@ def main(argv: list[str] | None = None) -> int:
             print("  NOTE: input equivalence to Run 1 was NOT confirmed.")
     _write_csv(out / "per_slice_metrics.csv", rows)
     _write_csv(out / "comparison_summary.csv", summary_rows)
-    _write_json(out / "provenance.json", {"runs": results, "input_comparisons": comparisons,
+    _write_json(out / "provenance.json", {"metric_schema_version": METRIC_SCHEMA_VERSION,
+                "runs": results, "input_comparisons": comparisons,
                 "analyzer_sha256": _sha256(Path(__file__)), "numpy_version": np.__version__})
     write_report(results, comparisons, out)
     if args.plot:
@@ -649,4 +788,7 @@ def main(argv: list[str] | None = None) -> int:
         for file in sorted(out.rglob("*")):
             if file.is_file() and file.name != "analysis_bundle.zip":
                 archive.write(file, file.relative_to(out))
-    print(f"Saved: {out}") 
+    print(f"Saved: {out}")
+
+if __name__ == "__main__":
+    raise SystemExit(main())
