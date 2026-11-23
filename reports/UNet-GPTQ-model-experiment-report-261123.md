@@ -76,4 +76,4 @@ fastMRI+ 박스를 복원 영상의 뒤집기·자르기 좌표에 맞춰 겹쳐
 
 가중치 단독 비교 후에는 같은 W4를 고정하고 전체 A4, 선택 시점 A8, 동일 예산의 무작위 시점 A8을 비교한다. 고주파·병변을 고려한 보정이나 저랭크 잔차 보완은 각각 독립 조건으로 평가한다.
 
-근거 자료 [뇌 FLAIR 학습 패키지](https://chatgpt.com/library?file_id=libfile_fde3_f-5084d4c0fae081919e5de68d8a6dcb77_dd1848f23f7881918eb02b9f66966835&account_id=personal) · [실험 설계 요약](https://chatgpt.com/library?file_id=libfile_fde3_f-5f66e16532dc819180208d6b6352248d_dd1848f23f7881918eb02b9f66966835&account_id=personal) · [가중치 및 활성값 비교 설계](https://github.com/HelenJeon0052/UNet-GPTQ/blob/77cdcb48ea6db3cfa6d6f35dde4d89f3a1c11b60/README.md)
+근거 자료 [가중치 및 활성값 비교 설계](https://github.com/HelenJeon0052/UNet-GPTQ/blob/77cdcb48ea6db3cfa6d6f35dde4d89f3a1c11b60/README.md)
